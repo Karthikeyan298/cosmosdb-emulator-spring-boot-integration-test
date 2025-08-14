@@ -1,11 +1,6 @@
 package com.example.cosmoskotlin
 
-import com.example.cosmoskotlin.model.Product
 import com.example.cosmoskotlin.repo.ProductRepository
-import com.github.dockerjava.api.command.CreateContainerCmd
-import com.github.dockerjava.api.model.ExposedPort
-import com.github.dockerjava.api.model.PortBinding
-import com.github.dockerjava.api.model.Ports
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
@@ -13,22 +8,11 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
 import org.testcontainers.containers.GenericContainer
 import org.testcontainers.utility.DockerImageName
-import org.testcontainers.utility.MountableFile
-import java.io.BufferedReader
-import java.io.File
-import java.io.FileInputStream
-import java.io.InputStreamReader
-import java.net.URL
-import java.nio.file.Files
+import java.io.FileOutputStream
 import java.nio.file.Paths
 import java.security.KeyStore
-import java.security.SecureRandom
-import java.security.cert.CertificateFactory
 import java.time.Duration
-import java.util.function.Consumer
-import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
-import javax.net.ssl.TrustManagerFactory
 
 @SpringBootTest
 class CosmosContainerTest {
@@ -36,45 +20,39 @@ class CosmosContainerTest {
     companion object {
         private lateinit var cosmos: GenericContainer<*>
         val currentPath = Paths.get(System.getProperty("user.dir"))
-        val cosmosCertificatePath = currentPath.resolve("cosmos.pem").toFile()
         val trustStorePath = currentPath.resolve("cosmos-truststore.jks").toFile()
 
-        private fun extractCertificate(host: String, port: Int): String {
-            // openssl s_client -connect localhost:8081 -showcerts -servername localhost
-            val command = listOf("openssl", "s_client", "-connect", "$host:$port", "-showcerts", "-servername", host)
+        private fun createTrustStoreFromServerCert(host: String, port: Int, trustStoreFile: String, password: String) {
+            val sslContext = SSLContext.getInstance("TLS")
+            sslContext.init(null, arrayOf(object : javax.net.ssl.X509TrustManager {
+                override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
+                override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {}
+                override fun checkServerTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {}
+            }), java.security.SecureRandom())
 
-            val process = ProcessBuilder(command)
-                .redirectErrorStream(true)
-                .start()
-            process.outputStream.close()
+            val socketFactory = sslContext.socketFactory
+            socketFactory.createSocket(host, port).use { socket ->
+                val sslSocket = socket as javax.net.ssl.SSLSocket
+                sslSocket.startHandshake()
+                val certs = sslSocket.session.peerCertificates
+                if (certs.isEmpty()) throw RuntimeException("No certificates retrieved from $host:$port")
 
-            val certBuilder = StringBuilder()
-            var isCert = false
-            // Extract cert part alone from complete response.
-            BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
-                reader.forEachLine { line ->
-                    when {
-                        line == "-----BEGIN CERTIFICATE-----" -> {
-                            isCert = true
-                            certBuilder.append(line).append("\n")
-                        }
-                        line == "-----END CERTIFICATE-----" -> {
-                            certBuilder.append(line).append("\n")
-                            isCert = false
-                        }
-                        isCert -> certBuilder.append(line).append("\n")
-                    }
+                val serverCert = certs[0] as java.security.cert.Certificate
+
+                // Create new empty JKS keystore
+                val ks = KeyStore.getInstance(KeyStore.getDefaultType())
+                ks.load(null, password.toCharArray())
+                ks.setCertificateEntry("cosmosemuroot", serverCert)
+
+                // Save keystore to file
+                FileOutputStream(trustStoreFile).use { fos ->
+                    ks.store(fos, password.toCharArray())
                 }
             }
-            return certBuilder.toString()
         }
-
         @JvmStatic
         @BeforeAll
         fun startContainer() {
-
-            // Cleanup old certificate as a sanity, cosmosdb emulator creates new certificate everytime.
-            cosmosCertificatePath.delete()
             trustStorePath.delete()
             cosmos = GenericContainer(DockerImageName.parse("mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator")).apply {
                 withExposedPorts(8081)
@@ -86,31 +64,17 @@ class CosmosContainerTest {
             cosmos.start()
 
             try {
-                val certificate = extractCertificate("localhost", 8081)
-                cosmosCertificatePath.writeText(certificate)
-                val defaultPassword = "changeit"
-                // Creating java keystore using the above certificate
-                // keytool -importcert -file <certificate_file> -keystore <keystore_file_name> -alias cosmosemuroot -storepass changeit
-                val keytoolCmd = arrayOf(
-                    "keytool", "-importcert",
-                    "-alias", "cosmosemuroot",
-                    "-file", cosmosCertificatePath.absolutePath,
-                    "-keystore", trustStorePath.absolutePath,
-                    "-storepass", defaultPassword,
-                    "-noprompt"
+                val trustStorePassword = "changeit"
+                createTrustStoreFromServerCert(
+                    host = "localhost",
+                    port = 8081,
+                    trustStoreFile = trustStorePath.absolutePath,
+                    password = trustStorePassword
                 )
 
-                val keytoolExitCode = ProcessBuilder(*keytoolCmd)
-                    .redirectErrorStream(true)
-                    .start()
-                    .waitFor()
-
-                if (keytoolExitCode != 0) {
-                    throw RuntimeException("keytool command failed with exit code $keytoolExitCode")
-                }
                 // Adding to java truststore
                 System.setProperty("javax.net.ssl.trustStore", trustStorePath.absolutePath)
-                System.setProperty("javax.net.ssl.trustStorePassword", defaultPassword)
+                System.setProperty("javax.net.ssl.trustStorePassword", trustStorePassword)
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -120,7 +84,6 @@ class CosmosContainerTest {
         @AfterAll
         fun stopContainer() {
             // Cleanup old certificate as a sanity, cosmosdb emulator creates new certificate everytime.
-            cosmosCertificatePath.delete()
             trustStorePath.delete()
             cosmos.stop()
         }
